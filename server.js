@@ -1,10 +1,12 @@
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
 
 const app = express();
+
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
@@ -18,6 +20,7 @@ if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const storage = {
     pendingComments: new Map(),
@@ -25,132 +28,122 @@ const storage = {
     ipTracking: new Map()
 };
 
-const Utils = {
-    hashIP(ip) {
-        return crypto.createHash('sha256').update(ip).digest('hex');
-    },
-    generateCommentId() {
-        return Date.now().toString(36) + Math.random().toString(36).slice(2);
-    },
-    generateVerifiedName() {
-        return `حساب موثق رقم ${Math.floor(Math.random() * 9999) + 1}`;
-    },
-    sanitize(text) {
-        return text.replace(/[<>]/g, '').trim();
-    },
-    getClientIP(req) {
-        return (
-            req.headers['x-forwarded-for']?.split(',')[0].trim() ||
-            req.socket.remoteAddress ||
-            req.ip
-        );
-    }
+const hashIP = ip =>
+    crypto.createHash('sha256').update(ip).digest('hex');
+
+const getClientIP = req =>
+    req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+    req.socket.remoteAddress ||
+    req.ip;
+
+const generateId = () =>
+    Date.now().toString(36) + Math.random().toString(36).slice(2);
+
+const generateName = () =>
+    `حساب موثق رقم ${Math.floor(Math.random() * 9999) + 1}`;
+
+const sanitize = text =>
+    text.replace(/[<>]/g, '').trim();
+
+const telegramSend = async (text, keyboard) => {
+    const r = await fetch(`${TELEGRAM_API}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            chat_id: ADMIN_CHAT_ID,
+            text,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: keyboard }
+        })
+    });
+    const j = await r.json();
+    return j.ok ? j.result.message_id : null;
 };
 
-const Telegram = {
-    async send(text, keyboard) {
-        const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: ADMIN_CHAT_ID,
-                text,
-                parse_mode: 'HTML',
-                reply_markup: { inline_keyboard: keyboard }
-            })
-        });
-        const data = await res.json();
-        return data.ok ? data.result.message_id : null;
-    },
+const telegramEdit = async (id, text) => {
+    await fetch(`${TELEGRAM_API}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            chat_id: ADMIN_CHAT_ID,
+            message_id: id,
+            text,
+            parse_mode: 'HTML'
+        })
+    });
+};
 
-    async edit(messageId, text) {
-        await fetch(`${TELEGRAM_API}/editMessageText`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: ADMIN_CHAT_ID,
-                message_id: messageId,
-                text,
-                parse_mode: 'HTML'
-            })
-        });
-    },
-
-    async answer(callbackId, text) {
-        await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                callback_query_id: callbackId,
-                text
-            })
-        });
-    }
+const telegramAnswer = async (id, text) => {
+    await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            callback_query_id: id,
+            text
+        })
+    });
 };
 
 app.get('/', (req, res) => {
     res.json({
         status: 'running',
-        backend: BASE_URL,
-        endpoints: ['/submit-comment', '/comments', '/webhook']
+        public: BASE_URL
     });
 });
 
 app.post('/submit-comment', async (req, res) => {
     const { name, text, clientId } = req.body;
+
     if (!text || !clientId) {
-        return res.status(400).json({ error: 'Invalid request' });
+        return res.status(400).json({ error: 'invalid data' });
     }
 
-    const ipHash = Utils.hashIP(Utils.getClientIP(req));
+    const ipHash = hashIP(getClientIP(req));
     const existing = storage.ipTracking.get(ipHash);
 
-    if (existing && existing.status === 'approved') {
-        return res.status(403).json({ error: 'Already commented' });
+    if (existing?.status === 'approved') {
+        return res.status(403).json({ error: 'already approved' });
     }
 
-    const commentId = Utils.generateCommentId();
+    const id = generateId();
+
     const comment = {
-        commentId,
-        text: Utils.sanitize(text),
-        displayName: name?.trim()
-            ? Utils.sanitize(name)
-            : Utils.generateVerifiedName(),
+        id,
+        name: name?.trim() ? sanitize(name) : generateName(),
+        text: sanitize(text),
         ipHash,
-        clientId,
-        timestamp: Date.now(),
-        status: 'pending'
+        status: 'pending',
+        time: Date.now()
     };
 
-    storage.pendingComments.set(commentId, comment);
-    storage.ipTracking.set(ipHash, { commentId, status: 'pending' });
+    storage.pendingComments.set(id, comment);
+    storage.ipTracking.set(ipHash, { id, status: 'pending' });
 
     const message = `
-🆕 <b>تعليق جديد</b>
+🆕 تعليق جديد
 
-👤 ${comment.displayName}
+👤 ${comment.name}
 💬 ${comment.text}
-🆔 ${comment.commentId}
-🕒 ${new Date(comment.timestamp).toLocaleString('ar')}
+🆔 ${id}
 `.trim();
 
     const keyboard = [[
-        { text: '✅ موافقة', callback_data: `approve_${commentId}` },
-        { text: '❌ رفض', callback_data: `reject_${commentId}` }
+        { text: '✅ موافقة', callback_data: `approve_${id}` },
+        { text: '❌ رفض', callback_data: `reject_${id}` }
     ]];
 
-    await Telegram.send(message, keyboard);
+    await telegramSend(message, keyboard);
 
-    res.json({ success: true, commentId });
+    res.json({ success: true });
 });
 
 app.get('/comments', (req, res) => {
     res.json(
         storage.approvedComments.map(c => ({
-            commentId: c.commentId,
+            id: c.id,
+            name: c.name,
             text: c.text,
-            displayName: c.displayName,
-            timestamp: c.timestamp
+            time: c.time
         }))
     );
 });
@@ -159,38 +152,32 @@ app.post('/webhook', async (req, res) => {
     const q = req.body.callback_query;
     if (!q) return res.sendStatus(200);
 
-    const [action, commentId] = q.data.split('_');
-    const comment = storage.pendingComments.get(commentId);
+    const [action, id] = q.data.split('_');
+    const comment = storage.pendingComments.get(id);
 
     if (!comment) {
-        await Telegram.answer(q.id, 'Already handled');
+        await telegramAnswer(q.id, 'processed');
         return res.sendStatus(200);
     }
 
     if (action === 'approve') {
         comment.status = 'approved';
         storage.approvedComments.push(comment);
-        storage.ipTracking.set(comment.ipHash, {
-            commentId,
-            status: 'approved'
-        });
+        storage.ipTracking.set(comment.ipHash, { id, status: 'approved' });
+        await telegramEdit(q.message.message_id, `✅ تم القبول\n\n${comment.text}`);
     } else {
         storage.ipTracking.delete(comment.ipHash);
+        await telegramEdit(q.message.message_id, `❌ تم الرفض\n\n${comment.text}`);
     }
 
-    storage.pendingComments.delete(commentId);
+    storage.pendingComments.delete(id);
+    await telegramAnswer(q.id, 'done');
 
-    await Telegram.edit(
-        q.message.message_id,
-        `${action === 'approve' ? '✅ تم قبول التعليق' : '❌ تم رفض التعليق'}\n\n${comment.text}`
-    );
-
-    await Telegram.answer(q.id, 'OK');
     res.sendStatus(200);
 });
 
 app.use((req, res) => {
-    res.status(404).json({ error: 'Not found' });
+    res.status(404).json({ error: 'not found' });
 });
 
 app.listen(PORT, () => {
