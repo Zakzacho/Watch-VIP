@@ -134,16 +134,16 @@ app.post('/submit-comment', async (req, res) => {
 
     await telegramSend(message, keyboard);
 
-    res.json({ success: true });
+    res.json({ success: true, commentId: id });
 });
 
 app.get('/comments', (req, res) => {
     res.json(
         storage.approvedComments.map(c => ({
-            id: c.id,
-            name: c.name,
+            commentId: c.id,
+            displayName: c.name,
             text: c.text,
-            time: c.time
+            timestamp: c.time
         }))
     );
 });
@@ -180,7 +180,7 @@ app.use((req, res) => {
     res.status(404).json({ error: 'not found' });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Public URL: ${BASE_URL}`);
 });
