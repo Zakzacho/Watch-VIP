@@ -4,41 +4,27 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
 
-// ===========================
-// الإعدادات الأساسية
-// ===========================
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const BASE_URL = 'https://site--watch-vip--j9hb6dlmp4qm.code.run';
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
-    console.error('❌ BOT_TOKEN و ADMIN_CHAT_ID مطلوبان');
+    console.error('Missing BOT_TOKEN or ADMIN_CHAT_ID');
     process.exit(1);
 }
 
-// ===========================
-// Middleware
-// ===========================
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// ===========================
-// التخزين المؤقت
-// ===========================
 const storage = {
     pendingComments: new Map(),
     approvedComments: [],
-    ipTracking: new Map(),
-    commentIdToMessageId: new Map()
+    ipTracking: new Map()
 };
 
-// ===========================
-// أدوات مساعدة
-// ===========================
 const Utils = {
     hashIP(ip) {
         return crypto.createHash('sha256').update(ip).digest('hex');
@@ -55,18 +41,14 @@ const Utils = {
     getClientIP(req) {
         return (
             req.headers['x-forwarded-for']?.split(',')[0].trim() ||
-            req.headers['x-real-ip'] ||
             req.socket.remoteAddress ||
             req.ip
         );
     }
 };
 
-// ===========================
-// خدمات تيليغرام
-// ===========================
-const TelegramService = {
-    async sendMessage(text, keyboard) {
+const Telegram = {
+    async send(text, keyboard) {
         const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -80,7 +62,8 @@ const TelegramService = {
         const data = await res.json();
         return data.ok ? data.result.message_id : null;
     },
-    async editMessage(messageId, text) {
+
+    async edit(messageId, text) {
         await fetch(`${TELEGRAM_API}/editMessageText`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -92,18 +75,19 @@ const TelegramService = {
             })
         });
     },
-    async answerCallback(id, text) {
+
+    async answer(callbackId, text) {
         await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ callback_query_id: id, text })
+            body: JSON.stringify({
+                callback_query_id: callbackId,
+                text
+            })
         });
     }
 };
 
-// ===========================
-// Routes
-// ===========================
 app.get('/', (req, res) => {
     res.json({
         status: 'running',
@@ -115,26 +99,27 @@ app.get('/', (req, res) => {
 app.post('/submit-comment', async (req, res) => {
     const { name, text, clientId } = req.body;
     if (!text || !clientId) {
-        return res.status(400).json({ error: 'بيانات غير مكتملة' });
+        return res.status(400).json({ error: 'Invalid request' });
     }
 
     const ipHash = Utils.hashIP(Utils.getClientIP(req));
     const existing = storage.ipTracking.get(ipHash);
 
     if (existing && existing.status === 'approved') {
-        return res.status(403).json({ error: 'لديك تعليق معتمد بالفعل' });
+        return res.status(403).json({ error: 'Already commented' });
     }
 
     const commentId = Utils.generateCommentId();
     const comment = {
         commentId,
         text: Utils.sanitize(text),
-        displayName: name?.trim() ? Utils.sanitize(name) : Utils.generateVerifiedName(),
+        displayName: name?.trim()
+            ? Utils.sanitize(name)
+            : Utils.generateVerifiedName(),
         ipHash,
         clientId,
         timestamp: Date.now(),
-        status: 'pending',
-        clicks: 0
+        status: 'pending'
     };
 
     storage.pendingComments.set(commentId, comment);
@@ -146,7 +131,7 @@ app.post('/submit-comment', async (req, res) => {
 👤 ${comment.displayName}
 💬 ${comment.text}
 🆔 ${comment.commentId}
-🕒 ${new Date(comment.timestamp).toLocaleString('ar-EG')}
+🕒 ${new Date(comment.timestamp).toLocaleString('ar')}
 `.trim();
 
     const keyboard = [[
@@ -154,8 +139,7 @@ app.post('/submit-comment', async (req, res) => {
         { text: '❌ رفض', callback_data: `reject_${commentId}` }
     ]];
 
-    const messageId = await TelegramService.sendMessage(message, keyboard);
-    if (messageId) storage.commentIdToMessageId.set(commentId, messageId);
+    await Telegram.send(message, keyboard);
 
     res.json({ success: true, commentId });
 });
@@ -166,8 +150,7 @@ app.get('/comments', (req, res) => {
             commentId: c.commentId,
             text: c.text,
             displayName: c.displayName,
-            timestamp: c.timestamp,
-            clicks: c.clicks
+            timestamp: c.timestamp
         }))
     );
 });
@@ -180,38 +163,37 @@ app.post('/webhook', async (req, res) => {
     const comment = storage.pendingComments.get(commentId);
 
     if (!comment) {
-        await TelegramService.answerCallback(q.id, 'تمت معالجة التعليق');
+        await Telegram.answer(q.id, 'Already handled');
         return res.sendStatus(200);
     }
 
     if (action === 'approve') {
         comment.status = 'approved';
         storage.approvedComments.push(comment);
-        storage.ipTracking.set(comment.ipHash, { commentId, status: 'approved' });
+        storage.ipTracking.set(comment.ipHash, {
+            commentId,
+            status: 'approved'
+        });
     } else {
         storage.ipTracking.delete(comment.ipHash);
     }
 
     storage.pendingComments.delete(commentId);
 
-    await TelegramService.editMessage(
+    await Telegram.edit(
         q.message.message_id,
-        `${action === 'approve' ? '✅ تم القبول' : '❌ تم الرفض'}\n\n${comment.text}`
+        `${action === 'approve' ? '✅ تم قبول التعليق' : '❌ تم رفض التعليق'}\n\n${comment.text}`
     );
-    await TelegramService.answerCallback(q.id, 'تم');
 
+    await Telegram.answer(q.id, 'OK');
     res.sendStatus(200);
 });
 
 app.use((req, res) => {
-    res.status(404).json({ error: 'المسار غير موجود' });
+    res.status(404).json({ error: 'Not found' });
 });
 
-// ===========================
-// تشغيل الخادم
-// ===========================
 app.listen(PORT, () => {
-    console.log(`✅ Server running internally on port ${PORT}`);
-    console.log(`🌐 Public URL: ${BASE_URL}`);
-    console.log(`🤖 Telegram bot active`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Public URL: ${BASE_URL}`);
 });
