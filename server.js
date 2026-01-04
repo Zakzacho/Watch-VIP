@@ -2,23 +2,41 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '';
-const BASE_URL = process.env.BASE_URL || '';
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
+
+const DATA_DIR = path.join(__dirname, 'data');
+const COMMENTS_FILE = path.join(DATA_DIR, 'comments.json');
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.options('*', cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(COMMENTS_FILE)) fs.writeFileSync(COMMENTS_FILE, '[]');
+
+const readComments = () => {
+    try {
+        return JSON.parse(fs.readFileSync(COMMENTS_FILE, 'utf8'));
+    } catch {
+        return [];
+    }
+};
+
+const writeComments = (comments) => {
+    fs.writeFileSync(COMMENTS_FILE, JSON.stringify(comments, null, 2));
+};
+
 const storage = {
     pendingComments: new Map(),
-    approvedComments: [],
     ipTracking: new Map()
 };
 
@@ -41,8 +59,8 @@ const sanitize = text =>
     String(text || '').replace(/[<>]/g, '').trim();
 
 const telegramSend = async (text, keyboard) => {
-    if (!TELEGRAM_API || !ADMIN_CHAT_ID) return null;
-    const r = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    if (!TELEGRAM_API || !ADMIN_CHAT_ID) return;
+    await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -52,8 +70,6 @@ const telegramSend = async (text, keyboard) => {
             reply_markup: { inline_keyboard: keyboard }
         })
     });
-    const j = await r.json();
-    return j.ok ? j.result.message_id : null;
 };
 
 const telegramEdit = async (id, text) => {
@@ -70,22 +86,14 @@ const telegramEdit = async (id, text) => {
     });
 };
 
-const telegramAnswer = async (id, text = '') => {
+const telegramAnswer = async (id) => {
     if (!TELEGRAM_API) return;
     await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            callback_query_id: id,
-            text,
-            show_alert: false
-        })
+        body: JSON.stringify({ callback_query_id: id })
     });
 };
-
-app.get('/', (req, res) => {
-    res.json({ status: 'running', uptime: process.uptime() });
-});
 
 app.get('/health', (req, res) => {
     res.json({ status: 'healthy' });
@@ -98,70 +106,59 @@ app.post('/submit-comment', async (req, res) => {
     }
 
     const ipHash = hashIP(getClientIP(req));
-    const existing = storage.ipTracking.get(ipHash);
-    if (existing?.status === 'approved') {
+    if (storage.ipTracking.get(ipHash) === 'approved') {
         return res.status(403).json({ error: 'already approved' });
     }
 
     const id = generateId();
 
     const comment = {
-        id,
-        name: name?.trim() ? sanitize(name) : generateName(),
+        commentId: id,
+        displayName: name?.trim() ? sanitize(name) : generateName(),
         text: sanitize(text),
         ipHash,
-        status: 'pending',
-        time: Date.now()
+        timestamp: Date.now()
     };
 
     storage.pendingComments.set(id, comment);
-    storage.ipTracking.set(ipHash, { id, status: 'pending' });
-
-    const message = `
-🆕 تعليق جديد
-
-👤 ${comment.name}
-💬 ${comment.text}
-🆔 ${id}
-`.trim();
+    storage.ipTracking.set(ipHash, 'pending');
 
     const keyboard = [[
         { text: '✅ موافقة', callback_data: `approve_${id}` },
         { text: '❌ رفض', callback_data: `reject_${id}` }
     ]];
 
-    await telegramSend(message, keyboard);
+    await telegramSend(
+        `🆕 تعليق جديد\n\n👤 ${comment.displayName}\n💬 ${comment.text}\n🆔 ${id}`,
+        keyboard
+    );
+
     res.json({ success: true, commentId: id });
 });
 
 app.get('/comments', (req, res) => {
-    res.json(
-        storage.approvedComments.map(c => ({
-            commentId: c.id,
-            displayName: c.name,
-            text: c.text,
-            timestamp: c.time
-        }))
-    );
+    res.json(readComments());
 });
 
 app.post('/webhook', async (req, res) => {
     const q = req.body?.callback_query;
     if (!q) return res.sendStatus(200);
 
-    await telegramAnswer(q.id);
-
-    const [action, id] = String(q.data || '').split('_');
+    const [action, id] = q.data.split('_');
     const comment = storage.pendingComments.get(id);
-    if (!comment) return res.sendStatus(200);
+    if (!comment) {
+        await telegramAnswer(q.id);
+        return res.sendStatus(200);
+    }
 
     if (action === 'approve') {
-        comment.status = 'approved';
-        storage.approvedComments.push(comment);
-        storage.ipTracking.set(comment.ipHash, { id, status: 'approved' });
+        const comments = readComments();
+        comments.push(comment);
+        writeComments(comments);
+        storage.ipTracking.set(comment.ipHash, 'approved');
         await telegramEdit(
             q.message.message_id,
-            `✅ تم القبول\n\n👤 ${comment.name}\n💬 ${comment.text}`
+            `✅ تم القبول\n\n👤 ${comment.displayName}\n💬 ${comment.text}`
         );
     }
 
@@ -169,16 +166,13 @@ app.post('/webhook', async (req, res) => {
         storage.ipTracking.delete(comment.ipHash);
         await telegramEdit(
             q.message.message_id,
-            `❌ تم الرفض\n\n👤 ${comment.name}\n💬 ${comment.text}`
+            `❌ تم الرفض\n\n👤 ${comment.displayName}\n💬 ${comment.text}`
         );
     }
 
     storage.pendingComments.delete(id);
+    await telegramAnswer(q.id);
     res.sendStatus(200);
-});
-
-app.use((req, res) => {
-    res.status(404).json({ error: 'not found' });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
