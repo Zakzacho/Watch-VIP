@@ -1,29 +1,25 @@
-require('dotenv').config();
-
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
-const path = require('path');
 
 const app = express();
 
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT) || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const BASE_URL = process.env.BASE_URL || 'https://site--watch-vip--j9hb6dlmp4qm.code.run';
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Accept']
-}));
+if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
+    console.error('Missing BOT_TOKEN or ADMIN_CHAT_ID');
+    process.exit(1);
+}
 
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
+app.options('*', cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-app.use(express.static(path.join(__dirname)));
 
 const storage = {
     pendingComments: new Map(),
@@ -50,8 +46,6 @@ const sanitize = text =>
     text.replace(/[<>]/g, '').trim();
 
 const telegramSend = async (text, keyboard) => {
-    if (!BOT_TOKEN || !ADMIN_CHAT_ID) return null;
-
     const r = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -62,14 +56,11 @@ const telegramSend = async (text, keyboard) => {
             reply_markup: { inline_keyboard: keyboard }
         })
     });
-
     const j = await r.json();
     return j.ok ? j.result.message_id : null;
 };
 
 const telegramEdit = async (id, text) => {
-    if (!BOT_TOKEN || !ADMIN_CHAT_ID) return;
-
     await fetch(`${TELEGRAM_API}/editMessageText`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -83,8 +74,6 @@ const telegramEdit = async (id, text) => {
 };
 
 const telegramAnswer = async (id, text) => {
-    if (!BOT_TOKEN) return;
-
     await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -94,6 +83,13 @@ const telegramAnswer = async (id, text) => {
         })
     });
 };
+
+app.get('/', (req, res) => {
+    res.json({
+        status: 'running',
+        uptime: process.uptime()
+    });
+});
 
 app.get('/health', (req, res) => {
     res.json({ status: 'healthy' });
@@ -127,26 +123,33 @@ app.post('/submit-comment', async (req, res) => {
     storage.pendingComments.set(id, comment);
     storage.ipTracking.set(ipHash, { id, status: 'pending' });
 
+    const message = `
+🆕 تعليق جديد
+
+👤 ${comment.name}
+💬 ${comment.text}
+🆔 ${id}
+`.trim();
+
     const keyboard = [[
         { text: '✅ موافقة', callback_data: `approve_${id}` },
         { text: '❌ رفض', callback_data: `reject_${id}` }
     ]];
 
-    await telegramSend(
-        `🆕 تعليق جديد\n\n👤 ${comment.name}\n💬 ${comment.text}`,
-        keyboard
-    );
+    await telegramSend(message, keyboard);
 
     res.json({ success: true, commentId: id });
 });
 
 app.get('/comments', (req, res) => {
-    res.json(storage.approvedComments.map(c => ({
-        commentId: c.id,
-        displayName: c.name,
-        text: c.text,
-        timestamp: c.time
-    })));
+    res.json(
+        storage.approvedComments.map(c => ({
+            commentId: c.id,
+            displayName: c.name,
+            text: c.text,
+            timestamp: c.time
+        }))
+    );
 });
 
 app.post('/webhook', async (req, res) => {
@@ -155,25 +158,33 @@ app.post('/webhook', async (req, res) => {
 
     const [action, id] = q.data.split('_');
     const comment = storage.pendingComments.get(id);
-    if (!comment) return res.sendStatus(200);
+
+    if (!comment) {
+        await telegramAnswer(q.id, 'processed');
+        return res.sendStatus(200);
+    }
 
     if (action === 'approve') {
         comment.status = 'approved';
         storage.approvedComments.push(comment);
         storage.ipTracking.set(comment.ipHash, { id, status: 'approved' });
         await telegramEdit(q.message.message_id, `✅ تم القبول\n\n${comment.text}`);
-    }
-
-    if (action === 'reject') {
+    } else {
         storage.ipTracking.delete(comment.ipHash);
         await telegramEdit(q.message.message_id, `❌ تم الرفض\n\n${comment.text}`);
     }
 
     storage.pendingComments.delete(id);
-    await telegramAnswer(q.id, 'تمت المعالجة');
+    await telegramAnswer(q.id, 'done');
+
     res.sendStatus(200);
 });
 
+app.use((req, res) => {
+    res.status(404).json({ error: 'not found' });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log('Server started');
+    console.log('PORT:', PORT);
 });
