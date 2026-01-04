@@ -1,5 +1,5 @@
 {
-  "name": "watch-vip-bot",
+  "name": "watch-vip",
   "version": "1.0.0",
   "description": "Telegram bot for comment moderation",
   "main": "server.js",
