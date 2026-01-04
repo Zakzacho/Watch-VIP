@@ -5,16 +5,11 @@ const crypto = require('crypto');
 
 const app = express();
 
-const PORT = parseInt(process.env.PORT) || 3000;
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+const BOT_TOKEN = process.env.BOT_TOKEN || '';
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '';
 const BASE_URL = process.env.BASE_URL || 'https://site--watch-vip--j9hb6dlmp4qm.code.run';
-const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
-
-if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
-    console.error('Missing BOT_TOKEN or ADMIN_CHAT_ID');
-    process.exit(1);
-}
+const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.options('*', cors());
@@ -43,9 +38,10 @@ const generateName = () =>
     `حساب موثق رقم ${Math.floor(Math.random() * 9999) + 1}`;
 
 const sanitize = text =>
-    text.replace(/[<>]/g, '').trim();
+    String(text || '').replace(/[<>]/g, '').trim();
 
 const telegramSend = async (text, keyboard) => {
+    if (!TELEGRAM_API || !ADMIN_CHAT_ID) return null;
     const r = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -61,6 +57,7 @@ const telegramSend = async (text, keyboard) => {
 };
 
 const telegramEdit = async (id, text) => {
+    if (!TELEGRAM_API || !ADMIN_CHAT_ID) return;
     await fetch(`${TELEGRAM_API}/editMessageText`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -74,6 +71,7 @@ const telegramEdit = async (id, text) => {
 };
 
 const telegramAnswer = async (id, text) => {
+    if (!TELEGRAM_API) return;
     await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -85,10 +83,7 @@ const telegramAnswer = async (id, text) => {
 };
 
 app.get('/', (req, res) => {
-    res.json({
-        status: 'running',
-        uptime: process.uptime()
-    });
+    res.json({ status: 'running', uptime: process.uptime() });
 });
 
 app.get('/health', (req, res) => {
@@ -96,7 +91,7 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/submit-comment', async (req, res) => {
-    const { name, text, clientId } = req.body;
+    const { name, text, clientId } = req.body || {};
 
     if (!text || !clientId) {
         return res.status(400).json({ error: 'invalid data' });
@@ -153,10 +148,10 @@ app.get('/comments', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-    const q = req.body.callback_query;
+    const q = req.body?.callback_query;
     if (!q) return res.sendStatus(200);
 
-    const [action, id] = q.data.split('_');
+    const [action, id] = String(q.data || '').split('_');
     const comment = storage.pendingComments.get(id);
 
     if (!comment) {
@@ -169,14 +164,13 @@ app.post('/webhook', async (req, res) => {
         storage.approvedComments.push(comment);
         storage.ipTracking.set(comment.ipHash, { id, status: 'approved' });
         await telegramEdit(q.message.message_id, `✅ تم القبول\n\n${comment.text}`);
-    } else {
+    } else if (action === 'reject') {
         storage.ipTracking.delete(comment.ipHash);
         await telegramEdit(q.message.message_id, `❌ تم الرفض\n\n${comment.text}`);
     }
 
     storage.pendingComments.delete(id);
     await telegramAnswer(q.id, 'done');
-
     res.sendStatus(200);
 });
 
