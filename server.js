@@ -8,7 +8,7 @@ const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '';
-const BASE_URL = process.env.BASE_URL || 'https://site--watch-vip--j9hb6dlmp4qm.code.run';
+const BASE_URL = process.env.BASE_URL || '';
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
@@ -70,14 +70,15 @@ const telegramEdit = async (id, text) => {
     });
 };
 
-const telegramAnswer = async (id, text) => {
+const telegramAnswer = async (id, text = '') => {
     if (!TELEGRAM_API) return;
     await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             callback_query_id: id,
-            text
+            text,
+            show_alert: false
         })
     });
 };
@@ -92,14 +93,12 @@ app.get('/health', (req, res) => {
 
 app.post('/submit-comment', async (req, res) => {
     const { name, text, clientId } = req.body || {};
-
     if (!text || !clientId) {
         return res.status(400).json({ error: 'invalid data' });
     }
 
     const ipHash = hashIP(getClientIP(req));
     const existing = storage.ipTracking.get(ipHash);
-
     if (existing?.status === 'approved') {
         return res.status(403).json({ error: 'already approved' });
     }
@@ -132,7 +131,6 @@ app.post('/submit-comment', async (req, res) => {
     ]];
 
     await telegramSend(message, keyboard);
-
     res.json({ success: true, commentId: id });
 });
 
@@ -151,26 +149,31 @@ app.post('/webhook', async (req, res) => {
     const q = req.body?.callback_query;
     if (!q) return res.sendStatus(200);
 
+    await telegramAnswer(q.id);
+
     const [action, id] = String(q.data || '').split('_');
     const comment = storage.pendingComments.get(id);
-
-    if (!comment) {
-        await telegramAnswer(q.id, 'processed');
-        return res.sendStatus(200);
-    }
+    if (!comment) return res.sendStatus(200);
 
     if (action === 'approve') {
         comment.status = 'approved';
         storage.approvedComments.push(comment);
         storage.ipTracking.set(comment.ipHash, { id, status: 'approved' });
-        await telegramEdit(q.message.message_id, `✅ تم القبول\n\n${comment.text}`);
-    } else if (action === 'reject') {
+        await telegramEdit(
+            q.message.message_id,
+            `✅ تم القبول\n\n👤 ${comment.name}\n💬 ${comment.text}`
+        );
+    }
+
+    if (action === 'reject') {
         storage.ipTracking.delete(comment.ipHash);
-        await telegramEdit(q.message.message_id, `❌ تم الرفض\n\n${comment.text}`);
+        await telegramEdit(
+            q.message.message_id,
+            `❌ تم الرفض\n\n👤 ${comment.name}\n💬 ${comment.text}`
+        );
     }
 
     storage.pendingComments.delete(id);
-    await telegramAnswer(q.id, 'done');
     res.sendStatus(200);
 });
 
@@ -179,6 +182,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log('Server started');
-    console.log('PORT:', PORT);
+    console.log('Server started on port', PORT);
 });
