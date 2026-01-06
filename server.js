@@ -151,8 +151,6 @@ app.post('/submit-comment', async (req, res) => {
     }
 
     const ipHash = hashIP(getClientIP(req));
-    // ملاحظة: تتبع IP هنا في الذاكرة فقط، سيتم إعادة تعيينه عند الريستارت
-    // إذا كنت تريد حظر دائم يجب حفظه في ملف أيضاً
     const existing = storage.ipTracking.get(ipHash);
     if (existing?.status === 'approved') {
         return res.status(403).json({ error: 'already approved' });
@@ -190,7 +188,6 @@ app.post('/submit-comment', async (req, res) => {
 });
 
 app.get('/comments', (req, res) => {
-    // إرجاع التعليقات المحملة من الملف والمخزنة في الذاكرة
     res.json(
         storage.approvedComments.map(c => ({
             commentId: c.id,
@@ -205,7 +202,6 @@ app.post('/webhook', async (req, res) => {
     const q = req.body?.callback_query;
     if (!q) return res.sendStatus(200);
 
-    // الرد السريع لتجنب تعليق التليجرام
     await telegramAnswer(q.id);
 
     const dataParts = String(q.data || '').split('_');
@@ -214,7 +210,6 @@ app.post('/webhook', async (req, res) => {
 
     const comment = storage.pendingComments.get(id);
     
-    // إذا لم يتم العثور على التعليق في الذاكرة (ربما بسبب إعادة تشغيل السيرفر)
     if (!comment) {
         await telegramEdit(
             q.message.message_id,
@@ -225,14 +220,10 @@ app.post('/webhook', async (req, res) => {
 
     if (action === 'approve') {
         comment.status = 'approved';
-        
-        // 1. إضافة للمصفوفة
         storage.approvedComments.push(comment);
-        
-        // 2. تحديث التتبع
         storage.ipTracking.set(comment.ipHash, { id, status: 'approved' });
         
-        // 3. حفظ التغييرات في الملف فوراً <--- هذا هو الجزء الأهم
+        // حفظ التغييرات في الملف فوراً
         saveData();
 
         await telegramEdit(
