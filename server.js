@@ -2,18 +2,66 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
-const fs = require('fs').promises;
-const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '';
-const BASE_URL = process.env.BASE_URL || '';
 const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : '';
 
-// إعداد CORS بشكل صحيح
+// إعداد PostgreSQL
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// إنشاء جدول التعليقات والـ Indexes عند التشغيل
+async function initializeDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS comments (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        text TEXT NOT NULL,
+        ip_hash TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        time BIGINT NOT NULL
+      )
+    `);
+    console.log('✅ تم إنشاء/التحقق من جدول التعليقات');
+
+    // إنشاء Indexes لتحسين الأداء
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_comments_status
+      ON comments(status)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_comments_ip_hash
+      ON comments(ip_hash)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_comments_time
+      ON comments(time DESC)
+    `);
+    console.log('✅ تم إنشاء/التحقق من الـ Indexes');
+  } catch (err) {
+    console.error('❌ خطأ في إنشاء الجدول:', err);
+    throw err;
+  }
+}
+
+// اختبار الاتصال
+pool.on('error', (err) => {
+  console.error('❌ خطأ في اتصال PostgreSQL:', err);
+});
+
+pool.on('connect', () => {
+  console.log('✅ تم الاتصال بـ PostgreSQL');
+});
+
+// إعداد CORS
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -22,50 +70,6 @@ app.use(cors({
 app.options('*', cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// مسار ملف التعليقات
-const DATA_DIR = path.join(__dirname, 'data');
-const COMMENTS_FILE = path.join(DATA_DIR, 'comments.json');
-
-// التخزين
-const storage = {
-  pendingComments: new Map(),
-  approvedComments: [],
-  ipTracking: new Map()
-};
-
-// دالة لتحميل التعليقات من الملف
-async function loadComments() {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    const data = await fs.readFile(COMMENTS_FILE, 'utf8');
-    storage.approvedComments = JSON.parse(data);
-    console.log(`✅ تم تحميل ${storage.approvedComments.length} تعليق`);
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      storage.approvedComments = [];
-      await saveComments();
-      console.log('✅ تم إنشاء ملف تعليقات جديد');
-    } else {
-      console.error('❌ خطأ في تحميل التعليقات:', err);
-    }
-  }
-}
-
-// دالة لحفظ التعليقات في الملف
-async function saveComments() {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    await fs.writeFile(
-      COMMENTS_FILE,
-      JSON.stringify(storage.approvedComments, null, 2),
-      'utf8'
-    );
-    console.log('💾 تم حفظ التعليقات');
-  } catch (err) {
-    console.error('❌ خطأ في حفظ التعليقات:', err);
-  }
-}
 
 // دوال مساعدة
 const hashIP = ip =>
@@ -85,6 +89,84 @@ const generateName = () =>
 
 const sanitize = text =>
   String(text || '').replace(/[<>]/g, '').trim();
+
+// دوال قاعدة البيانات
+async function saveCommentToDb(comment) {
+  try {
+    await pool.query(
+      `INSERT INTO comments (id, name, text, ip_hash, status, time)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [comment.id, comment.name, comment.text, comment.ipHash, comment.status, comment.time]
+    );
+    console.log('💾 تم حفظ التعليق في PostgreSQL');
+  } catch (err) {
+    console.error('❌ خطأ في حفظ التعليق:', err);
+    throw err;
+  }
+}
+
+async function updateCommentStatus(commentId, status) {
+  try {
+    await pool.query(
+      `UPDATE comments SET status = $1 WHERE id = $2`,
+      [status, commentId]
+    );
+    console.log(`✅ تم تحديث التعليق ${commentId} إلى ${status}`);
+  } catch (err) {
+    console.error('❌ خطأ في تحديث التعليق:', err);
+    throw err;
+  }
+}
+
+async function getCommentById(id) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM comments WHERE id = $1`,
+      [id]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    console.error('❌ خطأ في الحصول على التعليق:', err);
+    throw err;
+  }
+}
+
+async function getApprovedComments() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM comments WHERE status = 'approved' ORDER BY time DESC`
+    );
+    return rows || [];
+  } catch (err) {
+    console.error('❌ خطأ في استرجاع التعليقات:', err);
+    throw err;
+  }
+}
+
+async function hasApprovedComment(ipHash) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM comments WHERE ip_hash = $1 AND status = 'approved' LIMIT 1`,
+      [ipHash]
+    );
+    return rows.length > 0;
+  } catch (err) {
+    console.error('❌ خطأ في التحقق:', err);
+    throw err;
+  }
+}
+
+async function getPendingCommentsCount() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT COUNT(*) as count FROM comments WHERE status = 'pending'`
+    );
+    return parseInt(rows[0]?.count || 0, 10);
+  } catch (err) {
+    console.error('❌ خطأ في عد التعليقات:', err);
+    throw err;
+  }
+}
 
 // دوال Telegram
 const telegramSend = async (text, keyboard) => {
@@ -115,7 +197,7 @@ const telegramSend = async (text, keyboard) => {
   }
 };
 
-const telegramEdit = async (id, text) => {
+const telegramEdit = async (messageId, text) => {
   if (!TELEGRAM_API || !ADMIN_CHAT_ID) return;
   try {
     await fetch(`${TELEGRAM_API}/editMessageText`, {
@@ -123,7 +205,7 @@ const telegramEdit = async (id, text) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: ADMIN_CHAT_ID,
-        message_id: id,
+        message_id: messageId,
         text,
         parse_mode: 'HTML'
       })
@@ -133,14 +215,14 @@ const telegramEdit = async (id, text) => {
   }
 };
 
-const telegramAnswer = async (id, text = '') => {
+const telegramAnswer = async (callbackId, text = '') => {
   if (!TELEGRAM_API) return;
   try {
     await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        callback_query_id: id,
+        callback_query_id: callbackId,
         text,
         show_alert: false
       })
@@ -153,40 +235,50 @@ const telegramAnswer = async (id, text = '') => {
 // متغير للـ Polling
 let pollingOffset = 0;
 
-// دالة معالجة callback query
+// معالجة callback query
 async function handleCallbackQuery(callbackQuery) {
   await telegramAnswer(callbackQuery.id);
 
   const [action, id] = String(callbackQuery.data || '').split('_');
-  const comment = storage.pendingComments.get(id);
-
-  if (!comment) {
-    console.log('❌ التعليق غير موجود:', id);
+  
+  let comment;
+  try {
+    comment = await getCommentById(id);
+  } catch (err) {
+    console.error('❌ خطأ في جلب التعليق:', err);
     return;
   }
 
-  if (action === 'approve') {
-    console.log('✅ تمت الموافقة على التعليق:', id);
-    comment.status = 'approved';
-    storage.approvedComments.push(comment);
-    storage.ipTracking.set(comment.ipHash, { id, status: 'approved' });
-    await saveComments();
+  if (!comment || comment.status !== 'pending') {
+    console.log('❌ تعليق غير موجود أو ليس معلقًا:', id);
     await telegramEdit(
       callbackQuery.message.message_id,
-      `✅ تم القبول\n\n👤 ${comment.name}\n💬 ${comment.text}`
+      '⚠️ هذا التعليق تم معالجته بالفعل أو غير موجود'
     );
+    return;
   }
 
-  if (action === 'reject') {
-    console.log('❌ تم رفض التعليق:', id);
-    storage.ipTracking.delete(comment.ipHash);
-    await telegramEdit(
-      callbackQuery.message.message_id,
-      `❌ تم الرفض\n\n👤 ${comment.name}\n💬 ${comment.text}`
-    );
-  }
+  try {
+    if (action === 'approve') {
+      console.log('✅ تمت الموافقة على التعليق:', id);
+      await updateCommentStatus(id, 'approved');
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        `✅ تم القبول\n\n👤 ${comment.name}\n💬 ${comment.text}`
+      );
+    }
 
-  storage.pendingComments.delete(id);
+    if (action === 'reject') {
+      console.log('❌ تم رفض التعليق:', id);
+      await updateCommentStatus(id, 'rejected');
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        `❌ تم الرفض\n\n👤 ${comment.name}\n💬 ${comment.text}`
+      );
+    }
+  } catch (err) {
+    console.error('❌ خطأ في معالجة callback:', err);
+  }
 }
 
 // دالة Polling
@@ -198,7 +290,6 @@ async function startPolling() {
 
   console.log('🔄 جاري تشغيل Polling...');
 
-  // حذف webhook القديم إن وجد
   try {
     await fetch(`${TELEGRAM_API}/deleteWebhook`);
     console.log('✅ تم حذف webhook القديم');
@@ -206,7 +297,6 @@ async function startPolling() {
     console.error('⚠️ خطأ في حذف webhook:', err);
   }
 
-  // بدء Polling
   setInterval(async () => {
     try {
       const response = await fetch(
@@ -239,20 +329,30 @@ async function startPolling() {
 }
 
 // المسارات
-app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    uptime: process.uptime(),
-    comments: storage.approvedComments.length,
-    pending: storage.pendingComments.size
-  });
+app.get('/', async (req, res) => {
+  try {
+    const pendingCount = await getPendingCommentsCount();
+    res.json({
+      status: 'running',
+      uptime: process.uptime(),
+      pending: pendingCount,
+      database: 'PostgreSQL'
+    });
+  } catch (err) {
+    res.json({
+      status: 'running',
+      database: 'PostgreSQL',
+      error: 'Could not fetch pending count'
+    });
+  }
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     telegram: !!TELEGRAM_API,
-    polling: !!TELEGRAM_API
+    polling: !!TELEGRAM_API,
+    database: 'PostgreSQL'
   });
 });
 
@@ -265,27 +365,28 @@ app.post('/submit-comment', async (req, res) => {
     return res.status(400).json({ error: 'invalid data' });
   }
 
-  const ipHash = hashIP(getClientIP(req));
-  const existing = storage.ipTracking.get(ipHash);
-  if (existing?.status === 'approved') {
-    console.log('⚠️ IP لديه تعليق معتمد بالفعل');
-    return res.status(403).json({ error: 'already approved' });
-  }
+  try {
+    const ipHash = hashIP(getClientIP(req));
+    const alreadyApproved = await hasApprovedComment(ipHash);
 
-  const id = generateId();
-  const comment = {
-    id,
-    name: name?.trim() ? sanitize(name) : generateName(),
-    text: sanitize(text),
-    ipHash,
-    status: 'pending',
-    time: Date.now()
-  };
+    if (alreadyApproved) {
+      console.log('⚠️ IP لديه تعليق معتمد بالفعل');
+      return res.status(403).json({ error: 'already approved' });
+    }
 
-  storage.pendingComments.set(id, comment);
-  storage.ipTracking.set(ipHash, { id, status: 'pending' });
+    const id = generateId();
+    const comment = {
+      id,
+      name: name?.trim() ? sanitize(name) : generateName(),
+      text: sanitize(text),
+      ipHash,
+      status: 'pending',
+      time: Date.now()
+    };
 
-  const message = `
+    await saveCommentToDb(comment);
+
+    const message = `
 🆕 تعليق جديد
 
 👤 ${comment.name}
@@ -293,27 +394,38 @@ app.post('/submit-comment', async (req, res) => {
 🆔 ${id}
 `.trim();
 
-  const keyboard = [[
-    { text: '✅ موافقة', callback_data: `approve_${id}` },
-    { text: '❌ رفض', callback_data: `reject_${id}` }
-  ]];
+    const keyboard = [[
+      { text: '✅ موافقة', callback_data: `approve_${id}` },
+      { text: '❌ رفض', callback_data: `reject_${id}` }
+    ]];
 
-  const sent = await telegramSend(message, keyboard);
-  console.log(sent ? '✅ تم إرسال التعليق للبوت' : '❌ فشل إرسال التعليق للبوت');
+    const sent = await telegramSend(message, keyboard);
+    console.log(sent ? '✅ تم إرسال التعليق للبوت' : '❌ فشل إرسال التعليق للبوت');
 
-  res.json({ success: true, commentId: id });
+    res.json({ success: true, commentId: id });
+  } catch (err) {
+    console.error('❌ خطأ في معالجة التعليق:', err);
+    res.status(500).json({ error: 'server error' });
+  }
 });
 
-app.get('/comments', (req, res) => {
-  console.log(`📋 طلب التعليقات: ${storage.approvedComments.length} تعليق`);
-  res.json(
-    storage.approvedComments.map(c => ({
-      commentId: c.id,
-      displayName: c.name,
-      text: c.text,
-      timestamp: c.time
-    }))
-  );
+app.get('/comments', async (req, res) => {
+  try {
+    const comments = await getApprovedComments();
+    console.log(`📋 طلب التعليقات: ${comments.length} تعليق معتمد`);
+    
+    res.json(
+      comments.map(c => ({
+        commentId: c.id,
+        displayName: c.name,
+        text: c.text,
+        timestamp: c.time
+      }))
+    );
+  } catch (err) {
+    console.error('❌ خطأ في استرجاع التعليقات:', err);
+    res.status(500).json({ error: 'server error' });
+  }
 });
 
 app.use((req, res) => {
@@ -322,13 +434,34 @@ app.use((req, res) => {
 
 // بدء التشغيل
 (async () => {
-  await loadComments();
-  await startPolling();
+  try {
+    await initializeDatabase();
+    await startPolling();
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log('🚀 السيرفر يعمل على المنفذ', PORT);
-    console.log('🤖 BOT_TOKEN:', BOT_TOKEN ? '✅ موجود' : '❌ مفقود');
-    console.log('💬 ADMIN_CHAT_ID:', ADMIN_CHAT_ID ? '✅ موجود' : '❌ مفقود');
-    console.log('📡 الاتصال: Polling (بدون Webhook)');
-  });
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log('🚀 السيرفر يعمل على المنفذ', PORT);
+      console.log('🤖 BOT_TOKEN:', BOT_TOKEN ? '✅ موجود' : '❌ مفقود');
+      console.log('💬 ADMIN_CHAT_ID:', ADMIN_CHAT_ID ? '✅ موجود' : '❌ مفقود');
+      console.log('💾 قاعدة البيانات: PostgreSQL');
+      console.log('📡 الاتصال: Polling');
+    });
+  } catch (err) {
+    console.error('❌ خطأ في بدء التشغيل:', err);
+    process.exit(1);
+  }
 })();
+
+// Graceful Shutdown
+process.on('SIGTERM', async () => {
+  console.log('🛑 استلام SIGTERM - جاري الإغلاق بشكل آمن...');
+  await pool.end();
+  console.log('✅ تم إغلاق اتصال PostgreSQL');
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('🛑 استلام SIGINT - جاري الإغلاق بشكل آمن...');
+  await pool.end();
+  console.log('✅ تم إغلاق اتصال PostgreSQL');
+  process.exit(0);
+});
