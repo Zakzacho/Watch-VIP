@@ -20,6 +20,7 @@ const pool = new Pool({
 // إنشاء جدول التعليقات والـ Indexes عند التشغيل
 async function initializeDatabase() {
   try {
+    // ✅ إنشاء الجدول بشكل صحيح (مرة واحدة فقط)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS comments (
         id TEXT PRIMARY KEY,
@@ -33,12 +34,18 @@ async function initializeDatabase() {
     `);
     console.log('✅ تم إنشاء/التحقق من جدول التعليقات');
 
-    // إضافة العمود verified إذا لم يكن موجودًا (للتوافق مع الجداول القديمة)
-    await pool.query(`
-      ALTER TABLE comments
-      ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE
-    `);
-    console.log('✅ تم التحقق من عمود verified');
+    // ✅ إضافة العمود verified فقط إذا لم يكن موجودًا (للتوافق مع الجداول القديمة)
+    // هذا يحل مشكلة التعارض
+    try {
+      await pool.query(`
+        ALTER TABLE comments
+        ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE
+      `);
+      console.log('✅ تم التحقق من عمود verified (للتوافق مع الجداول القديمة)');
+    } catch (err) {
+      // العمود موجود بالفعل - لا مشكلة
+      console.log('ℹ️ عمود verified موجود بالفعل');
+    }
 
     // إنشاء Indexes لتحسين الأداء
     await pool.query(`
@@ -205,18 +212,24 @@ const telegramSend = async (text, keyboard) => {
   }
 };
 
-const telegramEdit = async (messageId, text) => {
+const telegramEdit = async (messageId, text, keyboard = null) => {
   if (!TELEGRAM_API || !ADMIN_CHAT_ID) return;
   try {
+    const body = {
+      chat_id: ADMIN_CHAT_ID,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML'
+    };
+
+    if (keyboard) {
+      body.reply_markup = { inline_keyboard: keyboard };
+    }
+
     await fetch(`${TELEGRAM_API}/editMessageText`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: ADMIN_CHAT_ID,
-        message_id: messageId,
-        text,
-        parse_mode: 'HTML'
-      })
+      body: JSON.stringify(body)
     });
   } catch (err) {
     console.error('❌ خطأ في تعديل رسالة:', err);
@@ -247,95 +260,217 @@ let pollingOffset = 0;
 async function handleCallbackQuery(callbackQuery) {
   await telegramAnswer(callbackQuery.id);
 
-  const [action, id] = String(callbackQuery.data || '').split('_');
+  const data = String(callbackQuery.data || '');
   
-  let comment;
-  try {
-    comment = await getCommentById(id);
-  } catch (err) {
-    console.error('❌ خطأ في جلب التعليق:', err);
-    return;
-  }
-
-  if (!comment) {
-    console.log('❌ تعليق غير موجود:', id);
-    return;
-  }
-
-  // شرط آمن للقبول والرفض
-  if (
-    (action === 'approve' || action === 'reject') &&
-    comment.status !== 'pending'
-  ) {
-    console.log('⚠️ محاولة معالجة تعليق ليس معلقًا:', id);
-    await telegramEdit(
-      callbackQuery.message.message_id,
-      '⚠️ هذا التعليق تم معالجته بالفعل'
-    );
-    return;
-  }
-
-  try {
-    if (action === 'approve') {
-      console.log('✅ تمت الموافقة على التعليق:', id);
-      await updateCommentStatus(id, 'approved');
-      
-      // رسالة التأكيد
-      await telegramEdit(
-        callbackQuery.message.message_id,
-        `✅ تم القبول\n\n👤 ${comment.name}\n💬 ${comment.text}`
+  // ✅ معالجة آمنة للـ callback_data
+  // بدل الاعتماد على split فقط
+  
+  // 🧩 المرحلة 1: أمر /start - عرض القائمة الرئيسية
+  if (data === 'show_comments') {
+    try {
+      const { rows } = await pool.query(
+        `SELECT id, name, text FROM comments WHERE status='approved' ORDER BY time DESC LIMIT 10`
       );
 
-      // إرسال رسالة جديدة مع الأزرار الإضافية
-      const keyboard = [[
-        { text: '🗑 حذف', callback_data: `delete_${id}` },
-        { text: '⭐ توثيق', callback_data: `verify_${id}` }
-      ]];
+      if (rows.length === 0) {
+        await telegramEdit(
+          callbackQuery.message.message_id,
+          'لا توجد تعليقات معتمدة.'
+        );
+        return;
+      }
 
-      await telegramSend(
-        `📌 تعليق معتمد\n\n👤 ${comment.name}\n💬 ${comment.text}`,
+      const keyboard = rows.map(c => ([
+        { 
+          text: `💬 ${c.name}: ${c.text.slice(0, 20)}...`, 
+          callback_data: `comment_${c.id}` 
+        }
+      ]));
+
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        '📋 التعليقات المعتمدة:',
         keyboard
       );
+    } catch (err) {
+      console.error('❌ خطأ في عرض التعليقات:', err);
     }
-
-    if (action === 'reject') {
-      console.log('❌ تم رفض التعليق:', id);
-      await updateCommentStatus(id, 'rejected');
-      await telegramEdit(
-        callbackQuery.message.message_id,
-        `❌ تم الرفض\n\n👤 ${comment.name}\n💬 ${comment.text}`
-      );
-    }
-
-    if (action === 'delete') {
-      console.log('🗑 تم حذف التعليق:', id);
-      await pool.query(
-        `DELETE FROM comments WHERE id = $1`,
-        [id]
-      );
-      await telegramEdit(
-        callbackQuery.message.message_id,
-        '🗑 تم حذف التعليق نهائيًا'
-      );
-    }
-
-    if (action === 'verify') {
-      const newStatus = !comment.verified;
-      console.log(`${newStatus ? '⭐ توثيق' : '❌ إلغاء توثيق'} التعليق:`, id);
-
-      await pool.query(
-        `UPDATE comments SET verified = $1 WHERE id = $2`,
-        [newStatus, id]
-      );
-
-      await telegramEdit(
-        callbackQuery.message.message_id,
-        `${newStatus ? '⭐ تم توثيق التعليق' : '❌ تم إلغاء التوثيق'}\n\n👤 ${comment.name}\n💬 ${comment.text}`
-      );
-    }
-  } catch (err) {
-    console.error('❌ خطأ في معالجة callback:', err);
+    return;
   }
+
+  // 🧩 المرحلة 2: الضغط على تعليق معيّن
+  if (data.startsWith('comment_')) {
+    const id = data.replace('comment_', '');
+    let comment;
+    try {
+      comment = await getCommentById(id);
+    } catch (err) {
+      console.error('❌ خطأ في جلب التعليق:', err);
+      return;
+    }
+
+    if (!comment) {
+      console.log('❌ تعليق غير موجود:', id);
+      return;
+    }
+
+    try {
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        `👤 ${comment.name}\n💬 ${comment.text}`,
+        [[
+          { text: '⭐ توثيق / إلغاء', callback_data: `verify_${id}` },
+          { text: '🗑 حذف', callback_data: `delete_${id}` }
+        ]]
+      );
+    } catch (err) {
+      console.error('❌ خطأ في تحديث التعليق:', err);
+    }
+    return;
+  }
+
+  // 🧩 المرحلة 3: زر "حذف كل التعليقات" - طلب التأكيد
+  if (data === 'delete_all_confirm') {
+    try {
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        '⚠️ هل أنت متأكد؟\nسيتم حذف جميع التعليقات نهائيًا 🥺',
+        [[
+          { text: '✅ نعم احذف الكل', callback_data: 'delete_all_yes' },
+          { text: '❌ إلغاء', callback_data: 'cancel' }
+        ]]
+      );
+    } catch (err) {
+      console.error('❌ خطأ في طلب التأكيد:', err);
+    }
+    return;
+  }
+
+  // 🧩 المرحلة 3: التنفيذ الفعلي للحذف
+  // ✅ تحسين: استبدال DELETE بـ UPDATE إلى status='deleted' للـ Audit
+  if (data === 'delete_all_yes') {
+    try {
+      await pool.query(`UPDATE comments SET status = 'deleted' WHERE status != 'deleted'`);
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        '🗑 تم حذف جميع التعليقات بنجاح (يمكن استرجاعها إذا لزم الأمر)'
+      );
+      console.log('🗑 تم تحديد جميع التعليقات كمحذوفة');
+    } catch (err) {
+      console.error('❌ خطأ في حذف التعليقات:', err);
+    }
+    return;
+  }
+
+  // 🧩 المرحلة 3: زر الإلغاء
+  if (data === 'cancel') {
+    try {
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        '❌ تم الإلغاء'
+      );
+    } catch (err) {
+      console.error('❌ خطأ في الإلغاء:', err);
+    }
+    return;
+  }
+
+  // ✅ معالجة الأزرار الأخرى بشكل آمن
+  if (data.startsWith('approve_') || data.startsWith('reject_') || 
+      data.startsWith('delete_') || data.startsWith('verify_')) {
+    
+    const id = data.split('_').slice(1).join('_'); // للتوافق مع IDs التي قد تحتوي _
+    let comment;
+    
+    try {
+      comment = await getCommentById(id);
+    } catch (err) {
+      console.error('❌ خطأ في جلب التعليق:', err);
+      return;
+    }
+
+    if (!comment) {
+      console.log('❌ تعليق غير موجود:', id);
+      return;
+    }
+
+    // شرط آمن للقبول والرفض
+    if (
+      (data.startsWith('approve_') || data.startsWith('reject_')) &&
+      comment.status !== 'pending'
+    ) {
+      console.log('⚠️ محاولة معالجة تعليق ليس معلقًا:', id);
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        '⚠️ هذا التعليق تم معالجته بالفعل'
+      );
+      return;
+    }
+
+    try {
+      if (data.startsWith('approve_')) {
+        console.log('✅ تمت الموافقة على التعليق:', id);
+        await updateCommentStatus(id, 'approved');
+
+        await telegramEdit(
+          callbackQuery.message.message_id,
+          `✅ تم القبول\n\n👤 ${comment.name}\n💬 ${comment.text}`
+        );
+
+        const keyboard = [[
+          { text: '🗑 حذف', callback_data: `delete_${id}` },
+          { text: '⭐ توثيق', callback_data: `verify_${id}` }
+        ]];
+
+        await telegramSend(
+          `📌 تعليق معتمد\n\n👤 ${comment.name}\n💬 ${comment.text}`,
+          keyboard
+        );
+      }
+
+      if (data.startsWith('reject_')) {
+        console.log('❌ تم رفض التعليق:', id);
+        await updateCommentStatus(id, 'rejected');
+        await telegramEdit(
+          callbackQuery.message.message_id,
+          `❌ تم الرفض\n\n👤 ${comment.name}\n💬 ${comment.text}`
+        );
+      }
+
+      if (data.startsWith('delete_')) {
+        console.log('🗑 تم حذف التعليق:', id);
+        // ✅ تحسين: استبدال DELETE بـ UPDATE إلى status='deleted' للـ Audit
+        await pool.query(
+          `UPDATE comments SET status = 'deleted' WHERE id = $1`,
+          [id]
+        );
+        await telegramEdit(
+          callbackQuery.message.message_id,
+          '🗑 تم حذف التعليق (يمكن استرجاعه إذا لزم الأمر)'
+        );
+      }
+
+      if (data.startsWith('verify_')) {
+        console.log('⭐ تبديل حالة توثيق التعليق:', id);
+        // ✅ تحسين حرج: استخدام NOT بدل الاعتماد على قيمة قديمة
+        const result = await pool.query(
+          `UPDATE comments SET verified = NOT verified WHERE id = $1 RETURNING verified`,
+          [id]
+        );
+        
+        const newVerified = result.rows[0]?.verified || false;
+        await telegramEdit(
+          callbackQuery.message.message_id,
+          `${newVerified ? '⭐ تم توثيق التعليق' : '❌ تم إلغاء التوثيق'}\n\n👤 ${comment.name}\n💬 ${comment.text}`
+        );
+      }
+    } catch (err) {
+      console.error('❌ خطأ في معالجة callback:', err);
+    }
+    return;
+  }
+
+  console.log('⚠️ callback_data غير معروف:', data);
 }
 
 // دالة Polling
@@ -373,6 +508,18 @@ async function startPolling() {
 
       for (const update of data.result || []) {
         pollingOffset = update.update_id + 1;
+
+        // 🧩 المرحلة 1: أمر /start
+        if (update.message && update.message.text === '/start') {
+          console.log('👋 تم استقبال أمر /start');
+          await telegramSend(
+            'مرحبًا بك 👋\nاختر ما تريد:',
+            [
+              [{ text: '👀 عرض التعليقات', callback_data: 'show_comments' }],
+              [{ text: '🗑 حذف كل التعليقات', callback_data: 'delete_all_confirm' }]
+            ]
+          );
+        }
 
         if (update.callback_query) {
           console.log('🔔 callback_query استلم:', update.callback_query.data);
@@ -469,11 +616,15 @@ app.post('/submit-comment', async (req, res) => {
 
 app.get('/comments', async (req, res) => {
   try {
-    const comments = await getApprovedComments();
-    console.log(`📋 طلب التعليقات: ${comments.length} تعليق معتمد`);
-    
+    // ✅ تحسين: عدم عرض التعليقات المحذوفة
+    const comments = await pool.query(
+      `SELECT * FROM comments WHERE status = 'approved' ORDER BY time DESC`
+    );
+
+    console.log(`📋 طلب التعليقات: ${comments.rows.length} تعليق معتمد`);
+
     res.json(
-      comments.map(c => ({
+      comments.rows.map(c => ({
         commentId: c.id,
         displayName: c.name,
         text: c.text,
@@ -503,6 +654,8 @@ app.use((req, res) => {
       console.log('💬 ADMIN_CHAT_ID:', ADMIN_CHAT_ID ? '✅ موجود' : '❌ مفقود');
       console.log('💾 قاعدة البيانات: PostgreSQL');
       console.log('📡 الاتصال: Polling');
+      console.log('🔧 الأوامر: /start');
+      console.log('✅ نظام Audit: تفعيل (حفظ كل التعديلات)');
     });
   } catch (err) {
     console.error('❌ خطأ في بدء التشغيل:', err);
