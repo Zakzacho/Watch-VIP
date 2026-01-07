@@ -27,10 +27,18 @@ async function initializeDatabase() {
         text TEXT NOT NULL,
         ip_hash TEXT NOT NULL,
         status TEXT DEFAULT 'pending',
+        verified BOOLEAN DEFAULT FALSE,
         time BIGINT NOT NULL
       )
     `);
     console.log('✅ تم إنشاء/التحقق من جدول التعليقات');
+
+    // إضافة العمود verified إذا لم يكن موجودًا (للتوافق مع الجداول القديمة)
+    await pool.query(`
+      ALTER TABLE comments
+      ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE
+    `);
+    console.log('✅ تم التحقق من عمود verified');
 
     // إنشاء Indexes لتحسين الأداء
     await pool.query(`
@@ -94,9 +102,9 @@ const sanitize = text =>
 async function saveCommentToDb(comment) {
   try {
     await pool.query(
-      `INSERT INTO comments (id, name, text, ip_hash, status, time)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [comment.id, comment.name, comment.text, comment.ipHash, comment.status, comment.time]
+      `INSERT INTO comments (id, name, text, ip_hash, status, verified, time)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [comment.id, comment.name, comment.text, comment.ipHash, comment.status, comment.verified, comment.time]
     );
     console.log('💾 تم حفظ التعليق في PostgreSQL');
   } catch (err) {
@@ -249,11 +257,20 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
-  if (!comment || comment.status !== 'pending') {
-    console.log('❌ تعليق غير موجود أو ليس معلقًا:', id);
+  if (!comment) {
+    console.log('❌ تعليق غير موجود:', id);
+    return;
+  }
+
+  // شرط آمن للقبول والرفض
+  if (
+    (action === 'approve' || action === 'reject') &&
+    comment.status !== 'pending'
+  ) {
+    console.log('⚠️ محاولة معالجة تعليق ليس معلقًا:', id);
     await telegramEdit(
       callbackQuery.message.message_id,
-      '⚠️ هذا التعليق تم معالجته بالفعل أو غير موجود'
+      '⚠️ هذا التعليق تم معالجته بالفعل'
     );
     return;
   }
@@ -262,9 +279,22 @@ async function handleCallbackQuery(callbackQuery) {
     if (action === 'approve') {
       console.log('✅ تمت الموافقة على التعليق:', id);
       await updateCommentStatus(id, 'approved');
+      
+      // رسالة التأكيد
       await telegramEdit(
         callbackQuery.message.message_id,
         `✅ تم القبول\n\n👤 ${comment.name}\n💬 ${comment.text}`
+      );
+
+      // إرسال رسالة جديدة مع الأزرار الإضافية
+      const keyboard = [[
+        { text: '🗑 حذف', callback_data: `delete_${id}` },
+        { text: '⭐ توثيق', callback_data: `verify_${id}` }
+      ]];
+
+      await telegramSend(
+        `📌 تعليق معتمد\n\n👤 ${comment.name}\n💬 ${comment.text}`,
+        keyboard
       );
     }
 
@@ -274,6 +304,33 @@ async function handleCallbackQuery(callbackQuery) {
       await telegramEdit(
         callbackQuery.message.message_id,
         `❌ تم الرفض\n\n👤 ${comment.name}\n💬 ${comment.text}`
+      );
+    }
+
+    if (action === 'delete') {
+      console.log('🗑 تم حذف التعليق:', id);
+      await pool.query(
+        `DELETE FROM comments WHERE id = $1`,
+        [id]
+      );
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        '🗑 تم حذف التعليق نهائيًا'
+      );
+    }
+
+    if (action === 'verify') {
+      const newStatus = !comment.verified;
+      console.log(`${newStatus ? '⭐ توثيق' : '❌ إلغاء توثيق'} التعليق:`, id);
+
+      await pool.query(
+        `UPDATE comments SET verified = $1 WHERE id = $2`,
+        [newStatus, id]
+      );
+
+      await telegramEdit(
+        callbackQuery.message.message_id,
+        `${newStatus ? '⭐ تم توثيق التعليق' : '❌ تم إلغاء التوثيق'}\n\n👤 ${comment.name}\n💬 ${comment.text}`
       );
     }
   } catch (err) {
@@ -381,6 +438,7 @@ app.post('/submit-comment', async (req, res) => {
       text: sanitize(text),
       ipHash,
       status: 'pending',
+      verified: false,
       time: Date.now()
     };
 
@@ -419,6 +477,7 @@ app.get('/comments', async (req, res) => {
         commentId: c.id,
         displayName: c.name,
         text: c.text,
+        verified: c.verified === true,
         timestamp: c.time
       }))
     );
